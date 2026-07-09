@@ -1,0 +1,164 @@
+name: Fetch & Shard HelioSeismic Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_year:
+        description: 'Start year (e.g. 2024 for last 3 years, 2008 for full archive)'
+        required: false
+        default: '2024'
+      min_magnitude:
+        description: 'Minimum earthquake magnitude'
+        required: false
+        default: '5.0'
+
+  schedule:
+    - cron: '0 6 * * 0'  # Every Sunday at 6am UTC
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-and-shard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create fetcher script
+        run: |
+          cat > fetcher.js << 'JSEOF'
+          const https = require('https');
+          const fs = require('fs');
+          const path = require('path');
+
+          const START_YEAR = parseInt(process.env.START_YEAR || new Date().getFullYear() - 2);
+          const END_YEAR   = new Date().getFullYear();
+          const MIN_MAG    = parseFloat(process.env.MIN_MAG || '5.0');
+          const OUT_DIR    = './solar_seismic_data/years';
+          const CHUNK_DAYS = 29;
+
+          function log(msg) { console.log(`[${new Date().toISOString().slice(11,19)}] ${msg}`); }
+
+          function fetchURL(hostname, urlPath) {
+            return new Promise((resolve, reject) => {
+              const req = https.request(
+                { hostname, path: urlPath, method: 'GET', headers: { 'User-Agent': 'HelioSeismic-Fetcher/1.0' } },
+                res => {
+                  let data = '';
+                  res.on('data', c => data += c);
+                  res.on('end', () => {
+                    if (res.statusCode !== 200) { reject(new Error(`HTTP ${res.statusCode}`)); return; }
+                    try {
+                      const t = data.trim();
+                      resolve((!t || t === 'null') ? [] : JSON.parse(t));
+                    } catch(e) { reject(e); }
+                  });
+                }
+              );
+              req.on('error', reject);
+              req.setTimeout(30000, () => { req.destroy(); reject(new Error('Timeout')); });
+              req.end();
+            });
+          }
+
+          function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+          function dateChunks(start, end) {
+            const chunks = [];
+            let cur = new Date(start);
+            const endD = new Date(end);
+            while (cur < endD) {
+              const ce = new Date(Math.min(cur.getTime() + CHUNK_DAYS * 86400000, endD.getTime()));
+              chunks.push([cur.toISOString().slice(0,10), ce.toISOString().slice(0,10)]);
+              cur = new Date(ce.getTime() + 86400000);
+            }
+            return chunks;
+          }
+
+          async function donki(ep, s, e, tries=3) {
+            for (let i=0; i<tries; i++) {
+              try { return await fetchURL('kauai.ccmc.gsfc.nasa.gov', `/DONKI/WS/get/${ep}?startDate=${s}&endDate=${e}`); }
+              catch(err) { log(`  Retry ${i+1} ${ep}: ${err.message}`); await sleep(3000); }
+            }
+            return [];
+          }
+
+          async function usgs(s, e, tries=3) {
+            for (let i=0; i<tries; i++) {
+              try {
+                const d = await fetchURL('earthquake.usgs.gov', `/fdsnws/event/1/query?format=geojson&starttime=${s}&endtime=${e}&minmagnitude=${MIN_MAG}&orderby=time&limit=20000`);
+                if (!d || !d.features) return [];
+                return d.features.map(f => ({
+                  time: f.properties.time, mag: f.properties.mag,
+                  place: f.properties.place||'',
+                  lat: Math.round(f.geometry.coordinates[1]*10000)/10000,
+                  lon: Math.round(f.geometry.coordinates[0]*10000)/10000,
+                  depth: f.geometry.coordinates[2]!=null ? Math.round(f.geometry.coordinates[2]*10)/10 : null
+                }));
+              } catch(err) { log(`  Retry ${i+1} USGS: ${err.message}`); await sleep(3000); }
+            }
+            return [];
+          }
+
+          function normalize(flares, cmes, hss, storms) {
+            const ev = [];
+            flares.forEach(f => { if (!f.peakTime&&!f.beginTime) return; ev.push({ type:'FLR', time:new Date(f.peakTime||f.beginTime).getTime(), label:f.classType||'?', location:f.sourceLocation||'', ar:f.activeRegionNum||null }); });
+            cmes.forEach(c => { if (!c.startTime) return; ev.push({ type:'CME', time:new Date(c.startTime).getTime(), label:'CME', note:(c.note||'').slice(0,80) }); });
+            hss.forEach(h => { if (!h.eventTime) return; ev.push({ type:'HSS', time:new Date(h.eventTime).getTime(), label:'HSS' }); });
+            storms.forEach(g => { if (!g.startTime) return; const kp=g.allKpIndex?Math.max(...g.allKpIndex.map(k=>k.kpIndex||0)):0; ev.push({ type:'GST', time:new Date(g.startTime).getTime(), label:`Kp${kp}`, kp }); });
+            return ev.sort((a,b)=>a.time-b.time);
+          }
+
+          async function main() {
+            log(`Fetching ${START_YEAR}-${END_YEAR} M${MIN_MAG}+`);
+            if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
+
+            for (let year=START_YEAR; year<=END_YEAR; year++) {
+              const s = `${year}-01-01`;
+              const e = year===END_YEAR ? new Date().toISOString().slice(0,10) : `${year}-12-31`;
+              log(`\n── ${year} ──`);
+              const chunks = dateChunks(s, e);
+              let fl=[],cm=[],hs=[],st=[],eq=[];
+              for (let i=0; i<chunks.length; i++) {
+                const [cs,ce] = chunks[i];
+                const [f,c,h,g] = await Promise.all([donki('FLR',cs,ce),donki('CME',cs,ce),donki('HSS',cs,ce),donki('GST',cs,ce)]);
+                fl.push(...f); cm.push(...c); hs.push(...h); st.push(...g);
+                if ((i+1)%3===0||i+1===chunks.length) log(`  chunk ${i+1}/${chunks.length} FLR:${fl.length} CME:${cm.length} HSS:${hs.length} GST:${st.length}`);
+                await sleep(200);
+              }
+              eq = await usgs(s, e);
+              log(`  EQ: ${eq.length}`);
+              const out = { year, generated: new Date().toISOString(), solarEvents: normalize(fl,cm,hs,st), seismicEvents: eq };
+              const op = path.join(OUT_DIR, `${year}.json`);
+              fs.writeFileSync(op, JSON.stringify(out));
+              log(`  ✓ ${op} (${(fs.statSync(op).size/1024).toFixed(1)} KB)`);
+            }
+            log('\nDone.');
+          }
+
+          main().catch(e => { console.error(e); process.exit(1); });
+          JSEOF
+
+      - name: Run fetcher
+        env:
+          START_YEAR: ${{ github.event.inputs.start_year || '2024' }}
+          MIN_MAG: ${{ github.event.inputs.min_magnitude || '5.0' }}
+        run: node fetcher.js
+
+      - name: Commit year-sharded data
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add solar_seismic_data/years/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update year-sharded data $(date -u +%Y-%m-%d) [skip ci]"
+            git push
+          fi
