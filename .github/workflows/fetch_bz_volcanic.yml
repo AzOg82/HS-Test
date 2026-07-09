@@ -1,0 +1,293 @@
+name: Fetch Bz Solar Wind & Volcanic Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_year:
+        description: 'Start year (2008 for full archive)'
+        required: false
+        default: '2008'
+  schedule:
+    - cron: '0 8 * * 0'  # Every Sunday at 8am UTC
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-bz-volcanic:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create fetcher script
+        run: |
+          cat > bz_volcanic_fetcher.js << 'JSEOF'
+          const https = require('https');
+          const http = require('http');
+          const fs = require('fs');
+          const path = require('path');
+
+          const START_YEAR = parseInt(process.env.START_YEAR || '2008');
+          const END_YEAR   = new Date().getFullYear();
+          const BZ_DIR     = './solar_seismic_data/bz';
+          const VOL_DIR    = './solar_seismic_data/volcanic';
+
+          function log(msg) { console.log(`[${new Date().toISOString().slice(11,19)}] ${msg}`); }
+          function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+          function fetchURL(url, retries = 3) {
+            return new Promise((resolve, reject) => {
+              const lib = url.startsWith('https') ? https : http;
+              const attempt = (n) => {
+                const req = lib.get(url, { headers: { 'User-Agent': 'HelioSeismic-Fetcher/1.0' } }, res => {
+                  // Follow redirects
+                  if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    return fetchURL(res.headers.location, retries).then(resolve).catch(reject);
+                  }
+                  if (res.statusCode !== 200) {
+                    return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+                  }
+                  let data = '';
+                  res.on('data', c => data += c);
+                  res.on('end', () => resolve(data));
+                });
+                req.on('error', err => {
+                  if (n < retries) {
+                    log(`  Retry ${n}/${retries}: ${err.message}`);
+                    setTimeout(() => attempt(n + 1), 3000);
+                  } else reject(err);
+                });
+                req.setTimeout(60000, () => { req.destroy(); reject(new Error('Timeout')); });
+              };
+              attempt(1);
+            });
+          }
+
+          // ── BZ DATA FROM NOAA NCEI ────────────────────────────────────────
+          // NOAA NCEI solar wind Bz data - 1-hour averages
+          // URL format: https://www.ncei.noaa.gov/data/omni-hourly-mean-solar-wind/access/YYYY/
+          // Files: omni_YYYYMM.csv
+          // Columns include: Bz (GSM), solar wind speed, etc.
+
+          async function fetchBzYear(year) {
+            const startDate = `${year}-01-01`;
+            const endDate   = year === END_YEAR ? new Date().toISOString().slice(0,10) : `${year}-12-31`;
+            
+            // NOAA SWPC JSON endpoint for solar wind data (available for recent years)
+            // For historical, use OMNI data from GSFC
+            const omniUrl = `https://omniweb.gsfc.nasa.gov/cgi/nx1.cgi?activity=retrieve&res=hour&spacecraft=omni2&start_date=${year}0101&end_date=${year}1231&vars=14&vars=17&vars=26&back=omni2`;
+            
+            // Alternative: NOAA NCEI OMNI hourly data via their API
+            const nceiUrl = `https://www.ncei.noaa.gov/access/services/data/v1?dataset=solar-wind-1hour&startDate=${startDate}&endDate=${endDate}&format=json&limit=50000`;
+
+            log(`  Fetching Bz ${year}...`);
+            
+            try {
+              const raw = await fetchURL(nceiUrl);
+              let records = [];
+              try {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) {
+                  records = parsed.map(r => ({
+                    time: new Date(r.DATE || r.date || r.TIME).getTime(),
+                    bz:   parseFloat(r.BZ_GSM || r.bz_gsm || r.Bz || 0),
+                    bt:   parseFloat(r.BT || r.bt || 0),
+                    speed: parseFloat(r.SPEED || r.speed || r.V || 0)
+                  })).filter(r => !isNaN(r.time) && !isNaN(r.bz));
+                }
+              } catch(e) {
+                log(`  JSON parse failed for ${year} Bz, trying CSV parse...`);
+                // Try parsing as CSV
+                const lines = raw.split('\n').filter(l => l.trim() && !l.startsWith('#'));
+                if (lines.length > 1) {
+                  const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+                  const bzIdx   = headers.findIndex(h => h.includes('bz') || h.includes('b_z'));
+                  const timeIdx = headers.findIndex(h => h.includes('time') || h.includes('date'));
+                  const speedIdx = headers.findIndex(h => h.includes('speed') || h.includes('v'));
+                  if (bzIdx >= 0 && timeIdx >= 0) {
+                    records = lines.slice(1).map(l => {
+                      const cols = l.split(',');
+                      return {
+                        time:  new Date(cols[timeIdx]?.trim()).getTime(),
+                        bz:    parseFloat(cols[bzIdx]?.trim()),
+                        speed: speedIdx >= 0 ? parseFloat(cols[speedIdx]?.trim()) : null
+                      };
+                    }).filter(r => !isNaN(r.time) && !isNaN(r.bz) && r.bz !== 9999 && r.bz !== -9999);
+                  }
+                }
+              }
+
+              // Find significant Bz events (southward excursions < -5 nT)
+              const bzEvents = [];
+              let inFlip = false;
+              let flipStart = null;
+              let minBz = 0;
+
+              records.forEach((r, i) => {
+                if (r.bz < -5 && !inFlip) {
+                  inFlip = true;
+                  flipStart = r.time;
+                  minBz = r.bz;
+                } else if (r.bz < -5 && inFlip) {
+                  if (r.bz < minBz) minBz = r.bz;
+                } else if (r.bz >= -5 && inFlip) {
+                  // End of southward excursion
+                  if (minBz < -10) { // Only log significant flips
+                    bzEvents.push({
+                      flipStart,
+                      flipEnd: records[i-1]?.time || r.time,
+                      minBz: Math.round(minBz * 10) / 10,
+                      durationHrs: Math.round((records[i-1]?.time - flipStart) / 36e5 * 10) / 10
+                    });
+                  }
+                  inFlip = false;
+                  minBz = 0;
+                }
+              });
+
+              log(`  Bz ${year}: ${records.length} hourly records, ${bzEvents.length} significant southward events`);
+              return { records: records.slice(0, 20000), events: bzEvents }; // Cap raw records
+
+            } catch(e) {
+              log(`  Bz ${year} failed: ${e.message}`);
+              return { records: [], events: [] };
+            }
+          }
+
+          // ── VOLCANIC DATA FROM GVP ────────────────────────────────────────
+          // Smithsonian GVP webservice - eruptions since 1960
+          async function fetchVolcanic() {
+            log('\n── Fetching Volcanic Data (GVP) ──');
+            
+            const gvpUrl = 'https://volcano.si.edu/database/webservices.cfm';
+            // GVP WFS endpoint for eruptions
+            const wfsUrl = 'https://volcano.si.edu/gvp_ewservices/geoserver/GVP/wfs?service=WFS&version=1.0.0&request=GetFeature&typeName=GVP:E3WebApp_Eruptions1960&outputFormat=application%2Fjson&maxFeatures=10000';
+            
+            try {
+              log('  Fetching GVP eruption catalog...');
+              const raw = await fetchURL(wfsUrl);
+              const data = JSON.parse(raw);
+              
+              if (!data.features) {
+                log('  No features in GVP response');
+                return [];
+              }
+
+              const eruptions = data.features
+                .filter(f => f.properties)
+                .map(f => {
+                  const p = f.properties;
+                  const coords = f.geometry?.coordinates;
+                  return {
+                    volcano:   p.Volcano_Name || p.VolcanoName || '',
+                    startYear: parseInt(p.StartYear || p.Start_Year || 0),
+                    startDate: p.StartDate || p.Start_Date || null,
+                    endDate:   p.EndDate || p.End_Date || null,
+                    vei:       parseInt(p.VEI || 0) || null,
+                    lat:       coords ? Math.round(coords[1]*10000)/10000 : null,
+                    lon:       coords ? Math.round(coords[0]*10000)/10000 : null,
+                    country:   p.Country || '',
+                    region:    p.Region || p.Volcanic_Region || ''
+                  };
+                })
+                .filter(e => e.startYear >= START_YEAR && e.startYear <= END_YEAR);
+
+              log(`  GVP: ${eruptions.length} eruptions ${START_YEAR}-${END_YEAR}`);
+              return eruptions;
+
+            } catch(e) {
+              log(`  GVP fetch failed: ${e.message}`);
+              // Fallback: USGS volcano notifications API
+              log('  Trying USGS volcano API fallback...');
+              try {
+                const usgsUrl = 'https://volcanoes.usgs.gov/hans-public/api/volcano/getElevatedVolcanoes';
+                const raw = await fetchURL(usgsUrl);
+                const data = JSON.parse(raw);
+                log(`  USGS volcano: ${Array.isArray(data) ? data.length : 0} elevated volcanoes`);
+                return Array.isArray(data) ? data.map(v => ({
+                  volcano: v.name || v.volcanoName || '',
+                  lat: v.latitude || null,
+                  lon: v.longitude || null,
+                  country: v.country || 'US',
+                  alertLevel: v.colorCode || v.alertLevel || ''
+                })) : [];
+              } catch(e2) {
+                log(`  USGS fallback also failed: ${e2.message}`);
+                return [];
+              }
+            }
+          }
+
+          // ── MAIN ──────────────────────────────────────────────────────────
+          async function main() {
+            log('HelioSeismic Extended Fetcher — Bz + Volcanic');
+            log(`Range: ${START_YEAR}-${END_YEAR}`);
+            log('================================================');
+
+            if (!fs.existsSync(BZ_DIR))  fs.mkdirSync(BZ_DIR,  { recursive: true });
+            if (!fs.existsSync(VOL_DIR)) fs.mkdirSync(VOL_DIR, { recursive: true });
+
+            // Fetch Bz year by year
+            log('\n── Fetching Bz Solar Wind Data (NOAA) ──');
+            for (let year = START_YEAR; year <= END_YEAR; year++) {
+              const bzData = await fetchBzYear(year);
+              const outPath = path.join(BZ_DIR, `${year}.json`);
+              fs.writeFileSync(outPath, JSON.stringify({ year, ...bzData }));
+              const size = (fs.statSync(outPath).size / 1024).toFixed(1);
+              log(`  ✓ ${outPath} (${size} KB)`);
+              await sleep(500);
+            }
+
+            // Fetch all volcanic data at once
+            const eruptions = await fetchVolcanic();
+            
+            // Shard volcanic data by year
+            log('\n── Sharding Volcanic Data by Year ──');
+            const byYear = {};
+            eruptions.forEach(e => {
+              const y = e.startYear;
+              if (y >= START_YEAR && y <= END_YEAR) {
+                if (!byYear[y]) byYear[y] = [];
+                byYear[y].push(e);
+              }
+            });
+
+            for (let year = START_YEAR; year <= END_YEAR; year++) {
+              const events = byYear[year] || [];
+              const outPath = path.join(VOL_DIR, `${year}.json`);
+              fs.writeFileSync(outPath, JSON.stringify({ year, eruptions: events }));
+              log(`  ✓ ${outPath} — ${events.length} eruptions`);
+            }
+
+            // Summary
+            log('\n================================================');
+            log('Done.');
+            log(`Bz files: ${BZ_DIR}/${START_YEAR}.json → ${END_YEAR}.json`);
+            log(`Volcanic files: ${VOL_DIR}/${START_YEAR}.json → ${END_YEAR}.json`);
+          }
+
+          main().catch(e => { console.error('Fatal:', e); process.exit(1); });
+          JSEOF
+
+      - name: Run Bz + Volcanic fetcher
+        env:
+          START_YEAR: ${{ github.event.inputs.start_year || '2008' }}
+        run: node bz_volcanic_fetcher.js
+
+      - name: Commit data
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add solar_seismic_data/bz/ solar_seismic_data/volcanic/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update Bz + volcanic data $(date -u +%Y-%m-%d) [skip ci]"
+            git push
+          fi
