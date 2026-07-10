@@ -134,28 +134,43 @@ jobs:
           // ── VOLCANIC FROM GVP ─────────────────────────────────────────────
           async function fetchVolcanic() {
             log('\n── Fetching Volcanic Data (Smithsonian GVP) ──');
-            const wfsUrl = 'https://webservices.volcano.si.edu/geoserver/GVP-VOTW/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=GVP-VOTW:E3WebApp_Eruptions1960&outputFormat=application%2Fjson&maxFeatures=10000';
+            const wfsUrl = 'https://webservices.volcano.si.edu/geoserver/GVP-VOTW/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=GVP-VOTW%3ASmithsonian_VOTW_Holocene_Eruptions&outputFormat=application%2Fjson&maxFeatures=10000';
 
             try {
               const raw = await fetchURL(wfsUrl);
               const data = JSON.parse(raw);
               if (!data.features) { log('  No features in GVP response'); return []; }
 
+              log(`  Sample raw feature: ${JSON.stringify(data.features[0]?.properties || {}).slice(0,300)}`);
+
               const eruptions = data.features
                 .filter(f => f.properties)
                 .map(f => {
                   const p = f.properties;
                   const coords = f.geometry?.coordinates;
+                  // Flexible field lookup — try many possible field name variants
+                  const findField = (keys) => {
+                    for (const k of keys) {
+                      if (p[k] !== undefined && p[k] !== null && p[k] !== '') return p[k];
+                    }
+                    return null;
+                  };
+                  const yearRaw = findField(['StartYear','Start_Year','start_year','StartDate','Start_Date','START_YEAR']);
+                  let startYear = parseInt(yearRaw);
+                  if (isNaN(startYear) && typeof yearRaw === 'string') {
+                    const m = yearRaw.match(/\d{4}/);
+                    if (m) startYear = parseInt(m[0]);
+                  }
                   return {
-                    volcano:   p.Volcano_Name || p.VolcanoName || p.volcano_name || '',
-                    startYear: parseInt(p.StartYear || p.Start_Year || p.start_year || 0),
-                    startDate: p.StartDate || p.Start_Date || null,
-                    endDate:   p.EndDate   || p.End_Date   || null,
-                    vei:       p.VEI !== undefined ? parseInt(p.VEI) : null,
-                    lat:       coords ? Math.round(coords[1]*10000)/10000 : null,
-                    lon:       coords ? Math.round(coords[0]*10000)/10000 : null,
-                    country:   p.Country || '',
-                    region:    p.Region || p.Volcanic_Region || p.volcanic_region || ''
+                    volcano:   findField(['Volcano_Name','VolcanoName','volcano_name','Volcano','VOLCANO_NAME']) || '',
+                    startYear: startYear || 0,
+                    startDate: findField(['StartDate','Start_Date']) || null,
+                    endDate:   findField(['EndDate','End_Date']) || null,
+                    vei:       (() => { const v = findField(['VEI','vei']); return v !== null ? parseInt(v) : null; })(),
+                    lat:       coords ? Math.round(coords[1]*10000)/10000 : (findField(['Latitude','latitude']) || null),
+                    lon:       coords ? Math.round(coords[0]*10000)/10000 : (findField(['Longitude','longitude']) || null),
+                    country:   findField(['Country','country']) || '',
+                    region:    findField(['Region','Volcanic_Region','volcanic_region']) || ''
                   };
                 })
                 .filter(e => e.startYear >= START_YEAR && e.startYear <= END_YEAR);
@@ -171,25 +186,14 @@ jobs:
 
           // ── MAIN ──────────────────────────────────────────────────────────
           async function main() {
-            log('HelioSeismic Extended Fetcher — Bz (OMNI2) + Volcanic (GVP)');
+            log('HelioSeismic Extended Fetcher — Volcanic (GVP) ONLY');
             log(`Range: ${START_YEAR}-${END_YEAR}`);
             log('================================================');
+            log('NOTE: Bz fetching skipped — already completed in prior run');
 
-            if (!fs.existsSync(BZ_DIR))  fs.mkdirSync(BZ_DIR,  { recursive: true });
             if (!fs.existsSync(VOL_DIR)) fs.mkdirSync(VOL_DIR, { recursive: true });
 
-            // Bz year by year
-            log('\n── Bz Solar Wind (NASA OMNI2) ──');
-            for (let year = START_YEAR; year <= END_YEAR; year++) {
-              const bzData = await fetchBzYear(year);
-              const outPath = path.join(BZ_DIR, `${year}.json`);
-              fs.writeFileSync(outPath, JSON.stringify({ year, ...bzData }));
-              const kb = (fs.statSync(outPath).size / 1024).toFixed(1);
-              log(`  ✓ ${year}.json (${kb} KB) — ${bzData.records.length} records, ${bzData.events.length} events`);
-              await sleep(300);
-            }
-
-            // Volcanic
+            // Volcanic only
             const eruptions = await fetchVolcanic();
             log('\n── Sharding Volcanic by Year ──');
             const byYear = {};
