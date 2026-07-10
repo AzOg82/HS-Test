@@ -134,7 +134,7 @@ jobs:
           // ── VOLCANIC FROM GVP ─────────────────────────────────────────────
           async function fetchVolcanic() {
             log('\n── Fetching Volcanic Data (Smithsonian GVP) ──');
-            const wfsUrl = 'https://volcano.si.edu/gvp_ewservices/geoserver/GVP/wfs?service=WFS&version=1.0.0&request=GetFeature&typeName=GVP:E3WebApp_Eruptions1960&outputFormat=application%2Fjson&maxFeatures=10000';
+            const wfsUrl = 'https://webservices.volcano.si.edu/geoserver/GVP-VOTW/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=GVP-VOTW:E3WebApp_Eruptions1960&outputFormat=application%2Fjson&maxFeatures=10000';
 
             try {
               const raw = await fetchURL(wfsUrl);
