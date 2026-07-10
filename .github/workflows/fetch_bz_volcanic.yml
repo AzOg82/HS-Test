@@ -155,7 +155,7 @@ jobs:
                     }
                     return null;
                   };
-                  const yearRaw = findField(['StartYear','Start_Year','start_year','StartDate','Start_Date','START_YEAR']);
+                  const yearRaw = findField(['StartDateYear','StartYear','Start_Year','start_year','StartDate','Start_Date','START_YEAR']);
                   let startYear = parseInt(yearRaw);
                   if (isNaN(startYear) && typeof yearRaw === 'string') {
                     const m = yearRaw.match(/\d{4}/);
@@ -164,9 +164,9 @@ jobs:
                   return {
                     volcano:   findField(['Volcano_Name','VolcanoName','volcano_name','Volcano','VOLCANO_NAME']) || '',
                     startYear: startYear || 0,
-                    startDate: findField(['StartDate','Start_Date']) || null,
+                    startDate: findField(['StartDate','Start_Date','StartDateYear']) || null,
                     endDate:   findField(['EndDate','End_Date']) || null,
-                    vei:       (() => { const v = findField(['VEI','vei']); return v !== null ? parseInt(v) : null; })(),
+                    vei:       (() => { const v = findField(['ExplosivityIndexMax','VEI','vei']); return v !== null ? parseInt(v) : null; })(),
                     lat:       coords ? Math.round(coords[1]*10000)/10000 : (findField(['Latitude','latitude']) || null),
                     lon:       coords ? Math.round(coords[0]*10000)/10000 : (findField(['Longitude','longitude']) || null),
                     country:   findField(['Country','country']) || '',
